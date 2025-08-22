@@ -249,7 +249,6 @@ namespace Whisper.Utils
             var dt = GetMicPosDist(_lastVadPos, micPos);
             if (dt < vadUpdateRateSamples)
                 return;
-            _lastVadPos = samplesCount;
             
             bool vad;
             
@@ -259,6 +258,7 @@ namespace Whisper.Utils
             }
             else
             {
+                _lastVadPos = samplesCount;
                 vad = UpdateSimpleVad(micPos);
             }
 
@@ -296,6 +296,9 @@ namespace Whisper.Utils
             var newSamples = GetNewSamples(micPos);
             if (newSamples == null || newSamples.Length == 0)
                 return IsVoiceDetected;
+            
+            // Update VAD position
+            _lastVadPos = (_lastVadPos + newSamples.Length) % ClipSamples;
             
             // convert to mono if needed
             if (_clip.channels > 1)
