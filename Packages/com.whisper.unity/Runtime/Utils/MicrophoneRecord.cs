@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using JetBrains.Annotations;
@@ -43,18 +43,31 @@ namespace Whisper.Utils
         [Header("Voice Activity Detection (VAD)")]
         [Tooltip("Should microphone check if audio input has speech?")]
         public bool useVad = true;
+        [Tooltip("VAD algorithm to use")]
+        public VadType vadType = VadType.Simple;
         [Tooltip("How often VAD checks if current audio chunk has speech")]
         public float vadUpdateRateSec = 0.1f;
         [Tooltip("Seconds of audio record that VAD uses to check if chunk has speech")]
         public float vadContextSec = 30f;
+        [Tooltip("Optional indicator that changes color when speech detected")]
+        [CanBeNull] public Image vadIndicatorImage;
+        
+        [Header("Simple VAD Settings")]
         [Tooltip("Window size where VAD tries to detect speech")]
         public float vadLastSec = 1.25f;
         [Tooltip("Threshold of VAD energy activation")]
         public float vadThd = 1.0f;
         [Tooltip("Threshold of VAD filter frequency")]
         public float vadFreqThd = 100.0f;
-        [Tooltip("Optional indicator that changes color when speech detected")]
-        [CanBeNull] public Image vadIndicatorImage;
+        
+        [Header("Silero VAD Settings")]
+        [Tooltip("Path to Silero VAD ONNX model file")]
+        public string sileroModelPath = "StreamingAssets/silero_vad.onnx";
+        [Tooltip("Silero VAD speech detection threshold (0.0-1.0)")]
+        [Range(0.0f, 1.0f)]
+        public float sileroThreshold = 0.5f;
+        [Tooltip("Silero VAD window size in samples (512, 1024, or 1536 recommended)")]
+        public int sileroWindowSize = 512;
         
         [Header("VAD Stop")]
         [Tooltip("If true microphone will stop record when no speech detected")]
@@ -92,6 +105,9 @@ namespace Whisper.Utils
         private float? _vadStopBegin;
         private int _lastMicPos;
         private bool _madeLoopLap;
+        private SileroVad _sileroVad;
+        private Queue<float> _sileroBuffer;
+        private int _sileroBufferSize;
 
         private string _selectedMicDevice;
 
@@ -125,6 +141,32 @@ namespace Whisper.Utils
                 microphoneDropdown.value = microphoneDropdown.options
                     .FindIndex(op => op.text == microphoneDefaultLabel);
                 microphoneDropdown.onValueChanged.AddListener(OnMicrophoneChanged);
+            }
+
+            InitializeSileroVad();
+        }
+
+        private void InitializeSileroVad()
+        {
+            if (vadType != VadType.Silero)
+                return;
+
+            try
+            {
+                var modelPath = Path.Combine(Application.streamingAssetsPath, 
+                    sileroModelPath.Replace("StreamingAssets/", ""));
+                
+                _sileroVad = new SileroVad(modelPath, frequency, sileroWindowSize, sileroThreshold);
+                _sileroBuffer = new Queue<float>();
+                _sileroBufferSize = sileroWindowSize;
+                
+                LogUtils.Verbose($"Silero VAD initialized with model: {modelPath}");
+            }
+            catch (Exception e)
+            {
+                LogUtils.Error($"Failed to initialize Silero VAD: {e.Message}");
+                LogUtils.Verbose("Falling back to Simple VAD");
+                vadType = VadType.Simple;
             }
         }
 
@@ -208,9 +250,16 @@ namespace Whisper.Utils
                 return;
             _lastVadPos = samplesCount;
             
-            // try to get sample for voice detection
-            var data = GetMicBufferLast(micPos, vadContextSec);
-            var vad = AudioUtils.SimpleVad(data, _clip.frequency, vadLastSec, vadThd, vadFreqThd);
+            bool vad;
+            
+            if (vadType == VadType.Silero)
+            {
+                vad = UpdateSileroVad(micPos);
+            }
+            else
+            {
+                vad = UpdateSimpleVad(micPos);
+            }
 
             // raise event if vad has changed
             if (vad != IsVoiceDetected)
@@ -228,6 +277,77 @@ namespace Whisper.Utils
             }
 
             UpdateVadStop();
+        }
+
+        private bool UpdateSimpleVad(int micPos)
+        {
+            // try to get sample for voice detection
+            var data = GetMicBufferLast(micPos, vadContextSec);
+            return AudioUtils.SimpleVad(data, _clip.frequency, vadLastSec, vadThd, vadFreqThd);
+        }
+
+        private bool UpdateSileroVad(int micPos)
+        {
+            if (_sileroVad == null)
+                return false;
+
+            // Get new audio samples
+            var newSamples = GetNewSamples(micPos);
+            if (newSamples == null || newSamples.Length == 0)
+                return IsVoiceDetected;
+
+            // Add new samples to buffer
+            foreach (var sample in newSamples)
+            {
+                _sileroBuffer.Enqueue(sample);
+                
+                // Keep buffer size at window size
+                if (_sileroBuffer.Count > _sileroBufferSize)
+                    _sileroBuffer.Dequeue();
+            }
+
+            // Process if we have enough samples
+            if (_sileroBuffer.Count >= _sileroBufferSize)
+            {
+                var windowSamples = _sileroBuffer.ToArray();
+                return _sileroVad.IsSpeech(windowSamples);
+            }
+
+            return IsVoiceDetected;
+        }
+
+        private float[] GetNewSamples(int micPos)
+        {
+            var currentLength = GetMicBufferLength(micPos);
+            if (currentLength <= _lastVadPos)
+                return null;
+
+            var newSampleCount = currentLength - _lastVadPos;
+            var newSamples = new float[newSampleCount];
+            
+            // Handle circular buffer
+            var startPos = _lastVadPos % ClipSamples;
+            if (startPos + newSampleCount <= ClipSamples)
+            {
+                _clip.GetData(newSamples, startPos);
+            }
+            else
+            {
+                // Wrap around
+                var firstPart = ClipSamples - startPos;
+                var secondPart = newSampleCount - firstPart;
+                
+                var firstPartData = new float[firstPart];
+                var secondPartData = new float[secondPart];
+                
+                _clip.GetData(firstPartData, startPos);
+                _clip.GetData(secondPartData, 0);
+                
+                Array.Copy(firstPartData, 0, newSamples, 0, firstPart);
+                Array.Copy(secondPartData, 0, newSamples, firstPart, secondPart);
+            }
+
+            return newSamples;
         }
         
         private void UpdateVadStop()
@@ -268,6 +388,13 @@ namespace Whisper.Utils
             _lastVadPos = 0;
             _vadStopBegin = null;
             _chunksLength = (int) (_clip.frequency * _clip.channels * chunksLengthSec);
+
+            // Reset Silero VAD state
+            if (vadType == VadType.Silero && _sileroVad != null)
+            {
+                _sileroVad.Reset();
+                _sileroBuffer?.Clear();
+            }
         }
 
         /// <summary>
@@ -385,6 +512,11 @@ namespace Whisper.Utils
 
             // circular buffer case
             return ClipSamples - prevPos + newPos;
+        }
+
+        private void OnDestroy()
+        {
+            _sileroVad?.Dispose();
         }
     }
 }
