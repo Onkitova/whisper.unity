@@ -295,6 +295,10 @@ namespace Whisper.Utils
             var newSamples = GetNewSamples(micPos);
             if (newSamples == null || newSamples.Length == 0)
                 return IsVoiceDetected;
+            
+            // convert to mono if needed
+            if (_clip.channels > 1)
+                newSamples = AudioUtils.ConvertToMono(newSamples, _clip.channels);
 
             // Add new samples to buffer
             foreach (var sample in newSamples)
