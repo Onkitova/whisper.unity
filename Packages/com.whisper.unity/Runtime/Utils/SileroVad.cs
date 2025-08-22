@@ -60,6 +60,7 @@ namespace Whisper.Utils
             try
             {
                 var probability = GetSpeechProbability(samples);
+                LogUtils.Verbose($"Silero VAD probability: {probability}");
                 return probability > _threshold;
             }
             catch (Exception e)
