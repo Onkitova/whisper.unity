@@ -1,6 +1,6 @@
 {
     "name": "com.whisper.unity",
-    "rootNamespace": "",
+    "rootNamespace": "Whisper",
     "references": [],
     "includePlatforms": [],
     "excludePlatforms": [],
