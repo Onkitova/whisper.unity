@@ -38,7 +38,7 @@ Clone this repository and open it as regular Unity project. It comes with exampl
 
 Alternatively you can add this repository to your project as a **Unity Package**. Add it by this git URL to your Unity Package Manager:
 ```
-https://github.com/Macoron/whisper.unity.git?path=/Packages/com.whisper.unity
+https://github.com/Onkitova/whisper.unity.git?path=/Packages/com.whisper.unity
 ```
 
 ### GPU Acceleration
