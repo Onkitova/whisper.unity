@@ -52,13 +52,10 @@ namespace Whisper.Utils
             }
         }
 
-        public bool IsSpeech(float[] samples, bool reset = false)
+        public bool IsSpeech(float[] samples)
         {
             if (_disposed || _session == null)
                 return false;
-            
-            if(reset)
-                Reset();
 
             try
             {
