@@ -318,7 +318,8 @@ namespace Whisper.Utils
             if (_sileroBuffer.Count >= _sileroBufferSize)
             {
                 var windowSamples = _sileroBuffer.ToArray();
-                return _sileroVad.IsSpeech(windowSamples);
+                var isSpeech = AudioUtils.SimpleVad(windowSamples, frequency);
+                return _sileroVad.IsSpeech(windowSamples, !isSpeech);
             }
 
             return IsVoiceDetected;
