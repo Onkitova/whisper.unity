@@ -107,8 +107,9 @@ namespace Whisper.Utils
         private int _lastMicPos;
         private bool _madeLoopLap;
         private SileroVad _sileroVad;
-        private Queue<float> _sileroBuffer;
-        private int _sileroBufferSize;
+    // Buffer of pending samples for Silero VAD (we now process ALL full windows, not just the latest)
+    private Queue<float> _sileroBuffer;
+    private int _sileroWindowProcessedSize; // cache of window size for clarity
 
         private string _selectedMicDevice;
 
@@ -159,7 +160,7 @@ namespace Whisper.Utils
                 
                 _sileroVad = new SileroVad(modelPath, frequency, sileroWindowSize, sileroThreshold);
                 _sileroBuffer = new Queue<float>();
-                _sileroBufferSize = sileroWindowSize;
+                _sileroWindowProcessedSize = sileroWindowSize;
                 
                 LogUtils.Verbose($"Silero VAD initialized with model: {modelPath}");
             }
@@ -304,24 +305,30 @@ namespace Whisper.Utils
             if (_clip.channels > 1)
                 newSamples = AudioUtils.ConvertToMono(newSamples, _clip.channels);
 
-            // Add new samples to buffer
-            foreach (var sample in newSamples)
+            // Append all new samples to queue (do NOT discard intermediate frames)
+            foreach (var s in newSamples)
+                _sileroBuffer.Enqueue(s);
+
+            // Process all full windows sequentially to keep Silero hidden state aligned with real audio timeline.
+            // Previous implementation only fed the latest window every vadUpdateRateSec, skipping audio and causing
+            // model state drift (leading to decreasing sensitivity after ~40s). This fixes that by iterating.
+            bool anySpeech = false;
+            while (_sileroBuffer.Count >= _sileroWindowProcessedSize)
             {
-                _sileroBuffer.Enqueue(sample);
-                
-                // Keep buffer size at window size
-                if (_sileroBuffer.Count > _sileroBufferSize)
-                    _sileroBuffer.Dequeue();
+                var windowSamples = new float[_sileroWindowProcessedSize];
+                for (int i = 0; i < _sileroWindowProcessedSize; i++)
+                    windowSamples[i] = _sileroBuffer.Dequeue();
+
+                // Run model on this contiguous frame
+                if (_sileroVad.IsSpeech(windowSamples))
+                    anySpeech = true;
             }
 
-            // Process if we have enough samples
-            if (_sileroBuffer.Count >= _sileroBufferSize)
-            {
-                var windowSamples = _sileroBuffer.ToArray();
-                return _sileroVad.IsSpeech(windowSamples);
-            }
+            // Mark processed samples position to currentLength (all available were consumed into windows)
+            _lastVadPos = GetMicBufferLength(micPos);
 
-            return IsVoiceDetected;
+            // If any frame within this update window had speech, treat as speech
+            return anySpeech ? true : IsVoiceDetected;
         }
 
         private float[] GetNewSamples(int micPos)
