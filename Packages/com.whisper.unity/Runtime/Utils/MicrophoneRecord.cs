@@ -110,7 +110,6 @@ namespace Whisper.Utils
     // Buffer of pending samples for Silero VAD (we now process ALL full windows, not just the latest)
     private Queue<float> _sileroBuffer;
     private int _sileroWindowProcessedSize; // cache of window size for clarity
-    private float _sileroLastProbability; // last probability from most recent processed window
 
         private string _selectedMicDevice;
 
@@ -313,30 +312,23 @@ namespace Whisper.Utils
             // Process all full windows sequentially to keep Silero hidden state aligned with real audio timeline.
             // Previous implementation only fed the latest window every vadUpdateRateSec, skipping audio and causing
             // model state drift (leading to decreasing sensitivity after ~40s). This fixes that by iterating.
-            // Process sequential frames, but only the LAST frame's probability determines current state.
-            // Earlier frames are necessary to advance internal model state but shouldn't stick "speech" forever.
-            var processed = false;
-            float lastProb = -1f;
+            bool anySpeech = false;
             while (_sileroBuffer.Count >= _sileroWindowProcessedSize)
             {
                 var windowSamples = new float[_sileroWindowProcessedSize];
                 for (int i = 0; i < _sileroWindowProcessedSize; i++)
                     windowSamples[i] = _sileroBuffer.Dequeue();
 
-                lastProb = _sileroVad.GetSpeechProbability(windowSamples);
-                processed = true;
+                // Run model on this contiguous frame
+                if (_sileroVad.IsSpeech(windowSamples))
+                    anySpeech = true;
             }
 
-            if (processed)
-            {
-                _sileroLastProbability = lastProb;
-                // Mark processed samples position to currentLength (all available were consumed into windows)
-                _lastVadPos = GetMicBufferLength(micPos);
-                return lastProb > sileroThreshold;
-            }
+            // Mark processed samples position to currentLength (all available were consumed into windows)
+            _lastVadPos = GetMicBufferLength(micPos);
 
-            // No full window yet; keep previous detection state
-            return IsVoiceDetected;
+            // If any frame within this update window had speech, treat as speech
+            return anySpeech ? true : IsVoiceDetected;
         }
 
         private float[] GetNewSamples(int micPos)
