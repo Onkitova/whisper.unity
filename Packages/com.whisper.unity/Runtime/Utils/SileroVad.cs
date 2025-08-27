@@ -111,6 +111,66 @@ namespace Whisper.Utils
             }
         }
 
+        /// <summary>
+        /// Evaluate probability using an external recurrent state (shadow or fresh) without modifying internal state.
+        /// Updates the provided state in-place with the new state produced by the model.
+        /// </summary>
+        public float EvaluateWithState(float[] samples, ref float[,,] externalState)
+        {
+            if (_disposed || _session == null || samples.Length != _windowSize)
+                return 0f;
+
+            try
+            {
+                var inputTensor = new DenseTensor<float>(samples, new[] { 1, _windowSize });
+                // flatten external state
+                var flatExternal = new float[2 * 1 * 128];
+                Buffer.BlockCopy(externalState, 0, flatExternal, 0, flatExternal.Length * sizeof(float));
+                var stateTensor = new DenseTensor<float>(flatExternal, new[] { 2, 1, 128 });
+                var srTensor = new DenseTensor<long>(new long[] { _sampleRate }, new[] { 1 });
+
+                var inputs = new List<NamedOnnxValue>
+                {
+                    NamedOnnxValue.CreateFromTensor("input", inputTensor),
+                    NamedOnnxValue.CreateFromTensor("sr", srTensor),
+                    NamedOnnxValue.CreateFromTensor("state", stateTensor)
+                };
+
+                using var results = _session.Run(inputs);
+                var output = results.First(x => x.Name == "output").AsEnumerable<float>().ToArray();
+                var newState = results.First(x => x.Name == "stateN").AsTensor<float>();
+
+                // copy back to externalState
+                var flatNew = newState.ToArray();
+                if (flatNew.Length == flatExternal.Length)
+                {
+                    Buffer.BlockCopy(flatNew, 0, externalState, 0, flatNew.Length * sizeof(float));
+                }
+                return output[0];
+            }
+            catch (Exception e)
+            {
+                LogUtils.Error($"Silero VAD shadow evaluation error: {e.Message}");
+                return 0f;
+            }
+        }
+
+        /// <summary>
+        /// Applies exponential decay to the internal recurrent state (soft reset) by multiplying by factor.
+        /// factor in [0,1]; lower values clear state faster.
+        /// </summary>
+        public void DecayState(float factor)
+        {
+            if (_state == null) return;
+            factor = Mathf.Clamp01(factor);
+            for (int a = 0; a < 2; a++)
+            for (int b = 0; b < 1; b++)
+            for (int c = 0; c < 128; c++)
+            {
+                _state[a, b, c] *= factor;
+            }
+        }
+
         private float[] ToFlatArray(float[,,] array)
         {
             var result = new float[2 * 1 * 128];

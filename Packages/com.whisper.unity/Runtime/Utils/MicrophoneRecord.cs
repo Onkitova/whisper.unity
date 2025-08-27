@@ -45,6 +45,18 @@ namespace Whisper.Utils
         [Header("Voice Activity Detection (VAD)")]
         [Tooltip("Should microphone check if audio input has speech?")]
         public bool useVad = true;
+    [Header("Silero Adaptive")]
+    [Tooltip("Use adaptive thresholds based on rolling silence probability (noise floor)")]
+    public bool sileroAdaptiveThresholds = true;
+    [Tooltip("Rolling window seconds to collect silence probabilities for noise floor")] public float sileroNoiseWindowSec = 5f;
+    [Tooltip("Margin added above noise floor for adaptive start threshold")] public float sileroAdaptiveMargin = 0.15f;
+    [Tooltip("Minimum adaptive start threshold clamp")] public float sileroAdaptiveMinStart = 0.45f;
+    [Tooltip("Maximum adaptive stop threshold clamp")] public float sileroAdaptiveMaxStop = 0.50f;
+    [Tooltip("Soft decay factor (0=hard reset, 0.25=default, 1=no decay)")]
+    [Range(0f,1f)] public float sileroSoftDecayFactor = 0.25f;
+    [Tooltip("Minimum seconds between auto resets (debounce)")] public float sileroResetDebounceSec = 5f;
+    [Tooltip("Consecutive shadow improvements needed to trigger a decay/reset")] public int sileroShadowAgreeNeeded = 3;
+    [Tooltip("Shadow probability - main probability delta to count as improvement")] public float sileroShadowDelta = 0.15f;
         [Tooltip("VAD algorithm to use")]
         public VadType vadType = VadType.Simple;
         [Tooltip("How often VAD checks if current audio chunk has speech")]
@@ -123,6 +135,11 @@ namespace Whisper.Utils
     private float _sileroLastSpeechTime;
 
         private string _selectedMicDevice;
+    private readonly Queue<(float time, float prob)> _sileroNoiseSamples = new();
+    private float _sileroAdaptiveStartCurrent;
+    private float _sileroAdaptiveStopCurrent;
+    private float[,,] _sileroShadowState;
+    private int _sileroShadowBetterCount;
 
         public string SelectedMicDevice
         {
@@ -175,6 +192,11 @@ namespace Whisper.Utils
                 _sileroBufferSize = sileroWindowSize;
                 _sileroLastResetTime = Time.realtimeSinceStartup;
                 _sileroLastSpeechTime = _sileroLastResetTime;
+                _sileroAdaptiveStartCurrent = sileroStartThreshold;
+                _sileroAdaptiveStopCurrent = sileroStopThreshold;
+                _sileroShadowState = new float[2,1,128];
+                _sileroNoiseSamples.Clear();
+                _sileroShadowBetterCount = 0;
                 
                 LogUtils.Verbose($"Silero VAD initialized with model: {modelPath}");
             }
@@ -333,38 +355,59 @@ namespace Whisper.Utils
             if (_sileroBuffer.Count >= _sileroBufferSize)
             {
                 var windowSamples = _sileroBuffer.ToArray();
-                // Get raw probability for hysteresis decision
                 var prob = _sileroVad.GetSpeechProbability(windowSamples);
+                if (_sileroShadowState == null) _sileroShadowState = new float[2,1,128];
+                var shadowProb = _sileroVad.EvaluateWithState(windowSamples, ref _sileroShadowState);
+                var shadowDelta = shadowProb - prob;
+                if (shadowDelta >= sileroShadowDelta) _sileroShadowBetterCount++; else if (_sileroShadowBetterCount > 0) _sileroShadowBetterCount--;
+
+                if (sileroAdaptiveThresholds)
+                {
+                    var now = Time.realtimeSinceStartup;
+                    if (!IsVoiceDetected) _sileroNoiseSamples.Enqueue((now, prob));
+                    while (_sileroNoiseSamples.Count > 0 && now - _sileroNoiseSamples.Peek().time > sileroNoiseWindowSec)
+                        _sileroNoiseSamples.Dequeue();
+                    if (_sileroNoiseSamples.Count >= 3)
+                    {
+                        float sum=0; int n=0; foreach(var s in _sileroNoiseSamples){ sum+=s.prob; n++; }
+                        var avg = sum / n;
+                        _sileroAdaptiveStartCurrent = Mathf.Clamp(avg + sileroAdaptiveMargin, sileroAdaptiveMinStart, 0.95f);
+                        _sileroAdaptiveStopCurrent = Mathf.Min(_sileroAdaptiveStartCurrent - 0.05f, sileroAdaptiveMaxStop);
+                    }
+                }
+
+                var startTh = sileroAdaptiveThresholds ? _sileroAdaptiveStartCurrent : sileroStartThreshold;
+                var stopTh = sileroAdaptiveThresholds ? _sileroAdaptiveStopCurrent : sileroStopThreshold;
                 var wasSpeech = IsVoiceDetected;
-                bool isSpeech;
-                if (wasSpeech)
-                {
-                    // Remain in speech until we go strictly below stop threshold
-                    isSpeech = prob >= sileroStopThreshold;
-                }
-                else
-                {
-                    // Enter speech only once we exceed start threshold
-                    isSpeech = prob >= sileroStartThreshold;
-                }
+                var isSpeech = wasSpeech ? prob >= stopTh : prob >= startTh;
 
-                LogUtils.Verbose($"Silero prob={prob:F3} speech={isSpeech} (hyst start={sileroStartThreshold:F2} stop={sileroStopThreshold:F2})");
+                LogUtils.Verbose($"Silero prob={prob:F3} shadow={shadowProb:F3} d={shadowDelta:F3} speech={isSpeech} (start={startTh:F2} stop={stopTh:F2}) shadowBetter={_sileroShadowBetterCount}");
 
-                // Track last speech time for silence-based reset
-                if (isSpeech)
-                    _sileroLastSpeechTime = Time.realtimeSinceStartup;
+                if (isSpeech) _sileroLastSpeechTime = Time.realtimeSinceStartup;
 
-                // Periodic reset to avoid state drift
-                if (sileroResetIntervalSec > 0f &&
-                    Time.realtimeSinceStartup - _sileroLastResetTime >= sileroResetIntervalSec &&
-                    Time.realtimeSinceStartup - _sileroLastSpeechTime >= sileroSilenceWindowSec)
+                bool intervalElapsed = sileroResetIntervalSec > 0f && Time.realtimeSinceStartup - _sileroLastResetTime >= sileroResetIntervalSec;
+                bool silenceWindowOk = Time.realtimeSinceStartup - _sileroLastSpeechTime >= sileroSilenceWindowSec;
+                bool debounceOk = Time.realtimeSinceStartup - _sileroLastResetTime >= sileroResetDebounceSec;
+                bool shadowSuggests = _sileroShadowBetterCount >= sileroShadowAgreeNeeded && silenceWindowOk && debounceOk;
+                if ((intervalElapsed && silenceWindowOk && debounceOk) || shadowSuggests)
                 {
-                    _sileroVad.Reset();
+                    if (sileroSoftDecayFactor <= 0.001f)
+                    {
+                        _sileroVad.Reset();
+                        _sileroShadowState = new float[2,1,128];
+                        LogUtils.Verbose(shadowSuggests ? "Silero hard reset (shadow)" : "Silero hard reset (interval)");
+                    }
+                    else
+                    {
+                        _sileroVad.DecayState(sileroSoftDecayFactor);
+                        _sileroShadowState = new float[2,1,128];
+                        LogUtils.Verbose(shadowSuggests ? "Silero soft decay (shadow)" : "Silero soft decay (interval)");
+                    }
                     _sileroBuffer.Clear();
                     _sileroLastResetTime = Time.realtimeSinceStartup;
-                    LogUtils.Verbose("Silero VAD state auto-reset (interval+silence)");
+                    if (!IsVoiceDetected) _sileroLastSpeechTime = _sileroLastResetTime;
+                    _sileroShadowBetterCount = 0;
                 }
-                // No separate silence reset; gating handled above
 
                 return isSpeech;
             }
@@ -452,12 +495,17 @@ namespace Whisper.Utils
                 _sileroBuffer?.Clear();
                 _sileroLastResetTime = Time.realtimeSinceStartup;
                 _sileroLastSpeechTime = _sileroLastResetTime;
+                _sileroAdaptiveStartCurrent = sileroStartThreshold;
+                _sileroAdaptiveStopCurrent = sileroStopThreshold;
+                _sileroShadowState = new float[2,1,128];
+                _sileroNoiseSamples.Clear();
+                _sileroShadowBetterCount = 0;
             }
         }
         /// Stop microphone record.
         /// </summary>
         /// <param name="dropTimeSec">How many last recording seconds to drop.</param>
-        public void StopRecord(float dropTimeSec = 0f)
+    public void StopRecord(float dropTimeSec = 0f)
         {
             if (!IsRecording)
                 return;
@@ -472,37 +520,28 @@ namespace Whisper.Utils
                 IsVoiceDetected = IsVoiceDetected,
                 Length = (float) data.Length / (_clip.frequency * _clip.channels)
             };
-            
-            // stop mic audio recording
+
             Microphone.End(RecordStartMicDevice);
             IsRecording = false;
             Destroy(_clip);
-            LogUtils.Verbose($"Stopped microphone recording. Final audio length " +
-                             $"{finalAudio.Length} ({finalAudio.Data.Length} samples)");
+            LogUtils.Verbose($"Stopped microphone recording. Final audio length {finalAudio.Length} ({finalAudio.Data.Length} samples)");
 
-            // update VAD, no speech with disabled mic
             if (IsVoiceDetected)
             {
                 IsVoiceDetected = false;
-                OnVadChanged?.Invoke(false);   
+                OnVadChanged?.Invoke(false);
             }
-            
-            // play echo sound
+
             if (echo)
             {
-                var echoClip = AudioClip.Create("echo", data.Length,
-                    _clip.channels, _clip.frequency, false);
+                var echoClip = AudioClip.Create("echo", data.Length, _clip.channels, _clip.frequency, false);
                 echoClip.SetData(data, 0);
                 PlayAudioAndDestroy.Play(echoClip, Vector3.zero);
             }
 
-            // finally, fire event
             OnRecordStop?.Invoke(finalAudio);
         }
 
-        /// <summary>
-        /// Get all recorded mic buffer.
-        /// </summary>
         private float[] GetMicBuffer(float dropTimeSec = 0f)
         {
             var micPos = Microphone.GetPosition(RecordStartMicDevice);
