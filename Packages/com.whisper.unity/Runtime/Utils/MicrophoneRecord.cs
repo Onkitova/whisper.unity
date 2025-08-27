@@ -5,6 +5,7 @@ using System.Linq;
 using JetBrains.Annotations;
 using UnityEngine;
 using UnityEngine.UI;
+using UnityEngine.Serialization;
 // ReSharper disable RedundantCast
 
 namespace Whisper.Utils
@@ -67,8 +68,17 @@ namespace Whisper.Utils
         [Tooltip("Silero VAD speech detection threshold (0.0-1.0)")]
         [Range(0.0f, 1.0f)]
         public float sileroThreshold = 0.5f;
-        [Tooltip("Silero VAD window size in samples (512, 1024, or 1536 recommended)")]
-        public int sileroWindowSize = 512;
+    [Tooltip("Silero VAD window size in samples (512, 1024, or 1536 recommended)")]
+    public int sileroWindowSize = 512;
+    [Tooltip("Probability threshold to START speech (hysteresis upper)")]
+    [Range(0.0f,1.0f)] public float sileroStartThreshold = 0.55f;
+    [Tooltip("Probability threshold to STOP speech (hysteresis lower)")]
+    [Range(0.0f,1.0f)] public float sileroStopThreshold = 0.40f;
+    [Tooltip("Periodically reset Silero recurrent state if drifted (seconds, 0 = never)")]
+    public float sileroResetIntervalSec = 20f;
+    [FormerlySerializedAs("sileroSilenceResetSec")]
+    [Tooltip("Required continuous silence duration before allowing an auto-reset (seconds)")]
+    public float sileroSilenceWindowSec = 0.75f;
         
         [Header("VAD Stop")]
         [Tooltip("If true microphone will stop record when no speech detected")]
@@ -109,6 +119,8 @@ namespace Whisper.Utils
         private SileroVad _sileroVad;
         private Queue<float> _sileroBuffer;
         private int _sileroBufferSize;
+    private float _sileroLastResetTime;
+    private float _sileroLastSpeechTime;
 
         private string _selectedMicDevice;
 
@@ -157,9 +169,12 @@ namespace Whisper.Utils
                 var modelPath = Path.Combine(Application.streamingAssetsPath, 
                     sileroModelPath.Replace("StreamingAssets/", ""));
                 
-                _sileroVad = new SileroVad(modelPath, frequency, sileroWindowSize, sileroThreshold);
+                // Use start threshold for internal Silero boolean pathway; we'll apply our own hysteresis anyway
+                _sileroVad = new SileroVad(modelPath, frequency, sileroWindowSize, sileroStartThreshold);
                 _sileroBuffer = new Queue<float>();
                 _sileroBufferSize = sileroWindowSize;
+                _sileroLastResetTime = Time.realtimeSinceStartup;
+                _sileroLastSpeechTime = _sileroLastResetTime;
                 
                 LogUtils.Verbose($"Silero VAD initialized with model: {modelPath}");
             }
@@ -318,7 +333,40 @@ namespace Whisper.Utils
             if (_sileroBuffer.Count >= _sileroBufferSize)
             {
                 var windowSamples = _sileroBuffer.ToArray();
-                return _sileroVad.IsSpeech(windowSamples);
+                // Get raw probability for hysteresis decision
+                var prob = _sileroVad.GetSpeechProbability(windowSamples);
+                var wasSpeech = IsVoiceDetected;
+                bool isSpeech;
+                if (wasSpeech)
+                {
+                    // Remain in speech until we go strictly below stop threshold
+                    isSpeech = prob >= sileroStopThreshold;
+                }
+                else
+                {
+                    // Enter speech only once we exceed start threshold
+                    isSpeech = prob >= sileroStartThreshold;
+                }
+
+                LogUtils.Verbose($"Silero prob={prob:F3} speech={isSpeech} (hyst start={sileroStartThreshold:F2} stop={sileroStopThreshold:F2})");
+
+                // Track last speech time for silence-based reset
+                if (isSpeech)
+                    _sileroLastSpeechTime = Time.realtimeSinceStartup;
+
+                // Periodic reset to avoid state drift
+                if (sileroResetIntervalSec > 0f &&
+                    Time.realtimeSinceStartup - _sileroLastResetTime >= sileroResetIntervalSec &&
+                    Time.realtimeSinceStartup - _sileroLastSpeechTime >= sileroSilenceWindowSec)
+                {
+                    _sileroVad.Reset();
+                    _sileroBuffer.Clear();
+                    _sileroLastResetTime = Time.realtimeSinceStartup;
+                    LogUtils.Verbose("Silero VAD state auto-reset (interval+silence)");
+                }
+                // No separate silence reset; gating handled above
+
+                return isSpeech;
             }
 
             return IsVoiceDetected;
@@ -402,10 +450,10 @@ namespace Whisper.Utils
             {
                 _sileroVad.Reset();
                 _sileroBuffer?.Clear();
+                _sileroLastResetTime = Time.realtimeSinceStartup;
+                _sileroLastSpeechTime = _sileroLastResetTime;
             }
         }
-
-        /// <summary>
         /// Stop microphone record.
         /// </summary>
         /// <param name="dropTimeSec">How many last recording seconds to drop.</param>
