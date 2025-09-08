@@ -133,6 +133,8 @@ namespace Whisper.Utils
         private int _sileroBufferSize;
     private float _sileroLastResetTime;
     private float _sileroLastSpeechTime;
+    // Tracks last microphone position (0..ClipSamples-1) whose samples were fed into Silero
+    private int _lastSileroMicPos;
 
         private string _selectedMicDevice;
     private readonly Queue<(float time, float prob)> _sileroNoiseSamples = new();
@@ -329,13 +331,10 @@ namespace Whisper.Utils
             if (_sileroVad == null)
                 return false;
 
-            // Get new audio samples
+            // Get only newly recorded samples since last Silero processing
             var newSamples = GetNewSamples(micPos);
             if (newSamples == null || newSamples.Length == 0)
                 return IsVoiceDetected;
-            
-            // Update VAD position
-            _lastVadPos = (_lastVadPos + newSamples.Length) % ClipSamples;
             
             // convert to mono if needed
             if (_clip.channels > 1)
@@ -417,36 +416,36 @@ namespace Whisper.Utils
 
         private float[] GetNewSamples(int micPos)
         {
-            var currentLength = GetMicBufferLength(micPos);
-            if (currentLength <= _lastVadPos)
-                return null;
+            // Calculate how many fresh samples were written since last Silero read
+            var dist = GetMicPosDist(_lastSileroMicPos, micPos);
+            if (dist <= 0)
+                return Array.Empty<float>();
 
-            var newSampleCount = currentLength - _lastVadPos;
-            var newSamples = new float[newSampleCount];
-            
-            // Handle circular buffer
-            var startPos = _lastVadPos % ClipSamples;
-            if (startPos + newSampleCount <= ClipSamples)
+            var start = _lastSileroMicPos;
+            var total = dist;
+            var data = new float[total];
+
+            if (micPos >= start)
             {
-                _clip.GetData(newSamples, startPos);
+                // Single contiguous segment
+                _clip.GetData(data, start);
             }
             else
             {
-                // Wrap around
-                var firstPart = ClipSamples - startPos;
-                var secondPart = newSampleCount - firstPart;
-                
-                var firstPartData = new float[firstPart];
-                var secondPartData = new float[secondPart];
-                
-                _clip.GetData(firstPartData, startPos);
-                _clip.GetData(secondPartData, 0);
-                
-                Array.Copy(firstPartData, 0, newSamples, 0, firstPart);
-                Array.Copy(secondPartData, 0, newSamples, firstPart, secondPart);
+                // Wrapped around circular buffer
+                var firstPart = ClipSamples - start;
+                var secondPart = total - firstPart;
+                var firstBuf = new float[firstPart];
+                var secondBuf = new float[secondPart];
+                _clip.GetData(firstBuf, start);
+                _clip.GetData(secondBuf, 0);
+                Array.Copy(firstBuf, 0, data, 0, firstPart);
+                Array.Copy(secondBuf, 0, data, firstPart, secondPart);
             }
 
-            return newSamples;
+            // Advance last processed mic position to current
+            _lastSileroMicPos = micPos;
+            return data;
         }
         
         private void UpdateVadStop()
@@ -529,9 +528,11 @@ namespace Whisper.Utils
             if (IsVoiceDetected)
             {
                 IsVoiceDetected = false;
-                OnVadChanged?.Invoke(false);
             }
 
+
+            // For update frequency tracking use current mic position (works across loops)
+            _lastVadPos = micPos;
             if (echo)
             {
                 var echoClip = AudioClip.Create("echo", data.Length, _clip.channels, _clip.frequency, false);
