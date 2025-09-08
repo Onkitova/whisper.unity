@@ -128,9 +128,14 @@ namespace Whisper.Utils
         private float? _vadStopBegin;
         private int _lastMicPos;
         private bool _madeLoopLap;
-        private SileroVad _sileroVad;
-        private Queue<float> _sileroBuffer;
-        private int _sileroBufferSize;
+    private SileroVad _sileroVad;
+    // Ring buffer (low allocation) replacing queue for Silero audio accumulation
+    private float[] _sileroRing;
+    private int _sileroRingWrite;
+    private int _sileroRingCount;
+    private int _sileroRingCapacity;
+    private int _sileroBufferSize; // Silero window size
+    private float[] _sileroWindow; // reusable window extraction buffer
     private float _sileroLastResetTime;
     private float _sileroLastSpeechTime;
     // Tracks last microphone position (0..ClipSamples-1) whose samples were fed into Silero
@@ -190,8 +195,8 @@ namespace Whisper.Utils
                 
                 // Use start threshold for internal Silero boolean pathway; we'll apply our own hysteresis anyway
                 _sileroVad = new SileroVad(modelPath, frequency, sileroWindowSize, sileroStartThreshold);
-                _sileroBuffer = new Queue<float>();
                 _sileroBufferSize = sileroWindowSize;
+                AllocateSileroBuffers();
                 _sileroLastResetTime = Time.realtimeSinceStartup;
                 _sileroLastSpeechTime = _sileroLastResetTime;
                 _sileroAdaptiveStartCurrent = sileroStartThreshold;
@@ -342,23 +347,16 @@ namespace Whisper.Utils
             if (_clip.channels > 1)
                 newSamples = AudioUtils.ConvertToMono(newSamples, _clip.channels);
 
-            // Add new samples to buffer
-            foreach (var sample in newSamples)
-            {
-                _sileroBuffer.Enqueue(sample);
-                
-                // Keep buffer size at window size
-                if (_sileroBuffer.Count > _sileroBufferSize)
-                    _sileroBuffer.Dequeue();
-            }
+            // Write new samples into ring buffer
+            WriteSileroSamples(newSamples);
 
-            // Process if we have enough samples
-            if (_sileroBuffer.Count >= _sileroBufferSize)
+            // Process if we have enough samples collected (use most recent window)
+            if (_sileroRingCount >= _sileroBufferSize)
             {
-                var windowSamples = _sileroBuffer.ToArray();
-                var prob = _sileroVad.GetSpeechProbability(windowSamples);
+                ExtractLatestSileroWindow(_sileroWindow);
+                var prob = _sileroVad.GetSpeechProbability(_sileroWindow);
                 if (_sileroShadowState == null) _sileroShadowState = new float[2,1,128];
-                var shadowProb = _sileroVad.EvaluateWithState(windowSamples, ref _sileroShadowState);
+                var shadowProb = _sileroVad.EvaluateWithState(_sileroWindow, ref _sileroShadowState);
                 var shadowDelta = shadowProb - prob;
                 if (shadowDelta >= sileroShadowDelta) _sileroShadowBetterCount++; else if (_sileroShadowBetterCount > 0) _sileroShadowBetterCount--;
 
@@ -404,7 +402,7 @@ namespace Whisper.Utils
                         _sileroShadowState = new float[2,1,128];
                         LogUtils.Verbose(shadowSuggests ? "Silero soft decay (shadow)" : "Silero soft decay (interval)");
                     }
-                    _sileroBuffer.Clear();
+                    // Ring buffer retains raw samples; no need to clear.
                     _sileroLastResetTime = Time.realtimeSinceStartup;
                     if (!IsVoiceDetected) _sileroLastSpeechTime = _sileroLastResetTime;
                     _sileroShadowBetterCount = 0;
@@ -425,6 +423,17 @@ namespace Whisper.Utils
 
             var start = _lastSileroMicPos;
             var total = dist;
+            // Cap burst to 8 windows worth to limit allocation size
+            if (_sileroBufferSize > 0)
+            {
+                int maxBurst = _sileroBufferSize * 8;
+                if (total > maxBurst)
+                {
+                    int drop = total - maxBurst;
+                    start = (start + drop) % ClipSamples;
+                    total = maxBurst;
+                }
+            }
             var data = new float[total];
 
             if (micPos >= start)
@@ -448,6 +457,74 @@ namespace Whisper.Utils
             // Advance last processed mic position to current
             _lastSileroMicPos = micPos;
             return data;
+        }
+        
+        private void AllocateSileroBuffers()
+        {
+            if (_sileroBufferSize <= 0) return;
+            _sileroRingCapacity = _sileroBufferSize * 8; // keep up to 8 windows
+            _sileroRing = new float[_sileroRingCapacity];
+            _sileroWindow = new float[_sileroBufferSize];
+            _sileroRingWrite = 0;
+            _sileroRingCount = 0;
+        }
+
+        private void ResetSileroBuffers()
+        {
+            if (_sileroRing != null)
+            {
+                _sileroRingWrite = 0;
+                _sileroRingCount = 0;
+            }
+            if (_sileroWindow == null && _sileroBufferSize > 0)
+                _sileroWindow = new float[_sileroBufferSize];
+        }
+
+        private void WriteSileroSamples(float[] samples)
+        {
+            if (samples == null || samples.Length == 0 || _sileroBufferSize <= 0) return;
+            if (_sileroRing == null || _sileroRing.Length == 0) AllocateSileroBuffers();
+            int cap = _sileroRingCapacity;
+            int len = samples.Length;
+            if (len >= cap)
+            {
+                Array.Copy(samples, len - cap, _sileroRing, 0, cap);
+                _sileroRingWrite = 0;
+                _sileroRingCount = cap;
+                return;
+            }
+            int remaining = len;
+            int src = 0;
+            while (remaining > 0)
+            {
+                int space = cap - _sileroRingWrite;
+                int copy = remaining < space ? remaining : space;
+                Array.Copy(samples, src, _sileroRing, _sileroRingWrite, copy);
+                _sileroRingWrite = (_sileroRingWrite + copy) % cap;
+                src += copy;
+                remaining -= copy;
+            }
+            _sileroRingCount = Mathf.Min(_sileroRingCount + len, cap);
+        }
+
+        private void ExtractLatestSileroWindow(float[] window)
+        {
+            if (window == null || window.Length != _sileroBufferSize) return;
+            if (_sileroRingCount < _sileroBufferSize) return;
+            int needed = _sileroBufferSize;
+            int cap = _sileroRingCapacity;
+            int start = (_sileroRingWrite - needed + cap) % cap;
+            if (start + needed <= cap)
+            {
+                Array.Copy(_sileroRing, start, window, 0, needed);
+            }
+            else
+            {
+                int first = cap - start;
+                int second = needed - first;
+                Array.Copy(_sileroRing, start, window, 0, first);
+                Array.Copy(_sileroRing, 0, window, first, second);
+            }
         }
         
         private void UpdateVadStop()
@@ -493,7 +570,7 @@ namespace Whisper.Utils
             if (vadType == VadType.Silero && _sileroVad != null)
             {
                 _sileroVad.Reset();
-                _sileroBuffer?.Clear();
+                ResetSileroBuffers();
                 _sileroLastResetTime = Time.realtimeSinceStartup;
                 _sileroLastSpeechTime = _sileroLastResetTime;
                 _sileroAdaptiveStartCurrent = sileroStartThreshold;
@@ -535,7 +612,7 @@ namespace Whisper.Utils
             }
             if (echo)
             {
-                var echoClip = AudioClip.Create("echo", data.Length, _clip.channels, _clip.frequency, false);
+                var echoClip = AudioClip.Create("echo", data.Length, finalAudio.Channels, finalAudio.Frequency, false);
                 echoClip.SetData(data, 0);
                 PlayAudioAndDestroy.Play(echoClip, Vector3.zero);
             }
