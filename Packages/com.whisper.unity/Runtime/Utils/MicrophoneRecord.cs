@@ -435,23 +435,31 @@ namespace Whisper.Utils
                 }
             }
             var data = new float[total];
-
-            if (micPos >= start)
+            // Determine if the requested block crosses the end of the circular buffer
+            bool crosses = start + total > ClipSamples;
+            if (!crosses)
             {
-                // Single contiguous segment
                 _clip.GetData(data, start);
             }
             else
             {
-                // Wrapped around circular buffer
-                var firstPart = ClipSamples - start;
-                var secondPart = total - firstPart;
+                int firstPart = ClipSamples - start;
+                int secondPart = total - firstPart;
+                if (secondPart < 0)
+                {
+                    // Should not happen, but guard against negative sizes
+                    firstPart = total;
+                    secondPart = 0;
+                }
                 var firstBuf = new float[firstPart];
-                var secondBuf = new float[secondPart];
                 _clip.GetData(firstBuf, start);
-                _clip.GetData(secondBuf, 0);
                 Array.Copy(firstBuf, 0, data, 0, firstPart);
-                Array.Copy(secondBuf, 0, data, firstPart, secondPart);
+                if (secondPart > 0)
+                {
+                    var secondBuf = new float[secondPart];
+                    _clip.GetData(secondBuf, 0);
+                    Array.Copy(secondBuf, 0, data, firstPart, secondPart);
+                }
             }
 
             // Advance last processed mic position to current
