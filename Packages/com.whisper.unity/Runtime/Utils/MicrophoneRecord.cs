@@ -297,7 +297,6 @@ namespace Whisper.Utils
             }
             else
             {
-                _lastVadPos = samplesCount;
                 vad = UpdateSimpleVad(micPos);
             }
 
@@ -315,6 +314,9 @@ namespace Whisper.Utils
                 var color = vad ? Color.green : Color.red;
                 vadIndicatorImage.color = color;
             }
+
+            // Track last processed mic position for cadence (works across loop wrap)
+            _lastVadPos = micPos;
 
             UpdateVadStop();
         }
@@ -499,6 +501,7 @@ namespace Whisper.Utils
                 _sileroShadowState = new float[2,1,128];
                 _sileroNoiseSamples.Clear();
                 _sileroShadowBetterCount = 0;
+                _lastSileroMicPos = 0;
             }
         }
         /// Stop microphone record.
@@ -528,11 +531,8 @@ namespace Whisper.Utils
             if (IsVoiceDetected)
             {
                 IsVoiceDetected = false;
+                OnVadChanged?.Invoke(false);
             }
-
-
-            // For update frequency tracking use current mic position (works across loops)
-            _lastVadPos = micPos;
             if (echo)
             {
                 var echoClip = AudioClip.Create("echo", data.Length, _clip.channels, _clip.frequency, false);
