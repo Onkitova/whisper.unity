@@ -25,6 +25,7 @@ namespace Whisper.Utils
     public delegate void OnVadChangedDelegate(bool isSpeechDetected);
     public delegate void OnChunkReadyDelegate(AudioChunk chunk);
     public delegate void OnRecordStopDelegate(AudioChunk recordedAudio);
+        public delegate void OnUtteranceSilenceDelegate();
     
     /// <summary>
     /// Controls microphone input settings and recording. 
@@ -119,6 +120,13 @@ namespace Whisper.Utils
         /// Returns <see cref="maxLengthSec"/> or less of recorded audio.
         /// </summary>
         public event OnRecordStopDelegate OnRecordStop;
+    /// <summary>
+    /// Raised once after speech ends and remains silent for vadUtteranceSilenceSec. Fires again only after new speech.
+    /// </summary>
+    public event OnUtteranceSilenceDelegate OnUtteranceSilence;
+    [Header("Utterance Detection")]
+    [Tooltip("Silence (sec) after speech end to mark an utterance boundary (0 disables)")]
+    public float vadUtteranceSilenceSec = 0.3f;
         
         private int _lastVadPos;
         private AudioClip _clip;
@@ -140,6 +148,9 @@ namespace Whisper.Utils
     private float _sileroLastSpeechTime;
     // Tracks last microphone position (0..ClipSamples-1) whose samples were fed into Silero
     private int _lastSileroMicPos;
+    // Generic last speech timestamp (any VAD type)
+    private float _lastVadSpeechTime;
+    private bool _utteranceSilenceRaised;
 
         private string _selectedMicDevice;
     private readonly Queue<(float time, float prob)> _sileroNoiseSamples = new();
@@ -311,6 +322,16 @@ namespace Whisper.Utils
                 _vadStopBegin = !vad ? Time.realtimeSinceStartup : (float?) null;
                 IsVoiceDetected = vad;
                 OnVadChanged?.Invoke(vad);   
+                if (vad)
+                {
+                    _lastVadSpeechTime = Time.realtimeSinceStartup;
+                    _utteranceSilenceRaised = false; // reset for next silence window
+                }
+                else if (_lastVadSpeechTime <= 0f)
+                {
+                    // initialize if first transition is to silence
+                    _lastVadSpeechTime = Time.realtimeSinceStartup;
+                }
             }
             
             // update vad indicator
@@ -324,6 +345,7 @@ namespace Whisper.Utils
             _lastVadPos = micPos;
 
             UpdateVadStop();
+            UpdateUtteranceSilence();
         }
 
         private bool UpdateSimpleVad(int micPos)
@@ -548,6 +570,21 @@ namespace Whisper.Utils
             }
         }
 
+        private void UpdateUtteranceSilence()
+        {
+            if (!useVad) return;
+            if (vadUtteranceSilenceSec <= 0f) return; // disabled
+            if (IsVoiceDetected) return; // currently speech
+            if (_utteranceSilenceRaised) return; // already fired for this silence window
+            if (_lastVadSpeechTime <= 0f) return; // no speech yet
+            var silentFor = Time.realtimeSinceStartup - _lastVadSpeechTime;
+            if (silentFor >= vadUtteranceSilenceSec)
+            {
+                OnUtteranceSilence?.Invoke();
+                _utteranceSilenceRaised = true;
+            }
+        }
+
         private void OnMicrophoneChanged(int ind)
         {
             if (microphoneDropdown == null) return;
@@ -588,6 +625,8 @@ namespace Whisper.Utils
                 _sileroShadowBetterCount = 0;
                 _lastSileroMicPos = 0;
             }
+            _lastVadSpeechTime = 0f;
+            _utteranceSilenceRaised = false;
         }
         /// Stop microphone record.
         /// </summary>
@@ -617,6 +656,11 @@ namespace Whisper.Utils
             {
                 IsVoiceDetected = false;
                 OnVadChanged?.Invoke(false);
+                if (!_utteranceSilenceRaised && Time.realtimeSinceStartup - _lastVadSpeechTime >= vadUtteranceSilenceSec)
+                {
+                    OnUtteranceSilence?.Invoke();
+                    _utteranceSilenceRaised = true;
+                }
             }
             if (echo)
             {
